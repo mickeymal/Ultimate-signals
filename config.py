@@ -13,6 +13,9 @@ SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
 
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "100"))
 
+# Only show markets resolving within this many days (short-term filter)
+MAX_DAYS_TO_EXPIRY = int(os.getenv("MAX_DAYS_TO_EXPIRY", "7"))
+
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 POLYMARKET_BASE_URL = "https://polymarket.com/event"
 

@@ -1,7 +1,9 @@
+import json
 import time
 import logging
 import requests
-from config import GAMMA_API_BASE, PAGE_SIZE, MIN_LIQUIDITY
+from datetime import datetime, timezone, timedelta
+from config import GAMMA_API_BASE, PAGE_SIZE, MIN_LIQUIDITY, MAX_DAYS_TO_EXPIRY
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +89,6 @@ def extract_probability(market: dict) -> float | None:
         return None
 
     if isinstance(outcome_prices, str):
-        import json
         try:
             outcome_prices = json.loads(outcome_prices)
         except (ValueError, TypeError):
@@ -120,30 +121,69 @@ def build_market_url(market: dict) -> str:
     return f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
 
 
+def _parse_end_date(market: dict) -> datetime | None:
+    raw = market.get("endDate") or market.get("endDateIso") or market.get("end_date_iso")
+    if not raw:
+        return None
+    # Strip trailing Z, handle +00:00
+    raw = str(raw).replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(raw).astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def days_until_expiry(market: dict) -> float | None:
+    end = _parse_end_date(market)
+    if end is None:
+        return None
+    delta = end - datetime.now(timezone.utc)
+    return delta.total_seconds() / 86400
+
+
 def filter_signal_markets(markets: list[dict], low: float, high: float) -> list[dict]:
     """
-    Return markets whose YES probability is outside the normal range,
-    i.e., unrealistically low (<= low) or surprisingly near-certain (>= high).
-    Only includes markets that have enough liquidity to be real markets.
+    Return short-term markets (≤ MAX_DAYS_TO_EXPIRY) whose YES probability is
+    extreme — either a long shot (≤ low%) or near-certain (≥ high%).
     """
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(days=MAX_DAYS_TO_EXPIRY)
     signals = []
+
     for m in markets:
         prob = extract_probability(m)
         if prob is None:
             continue
+
         liquidity = extract_liquidity(m)
         if liquidity < MIN_LIQUIDITY:
             continue
+
+        end_dt = _parse_end_date(m)
+        # Skip markets with no end date or expiring too far out
+        if end_dt is None or end_dt > cutoff:
+            continue
+        # Skip already-expired markets
+        if end_dt <= now:
+            continue
+
         if prob <= low or prob >= high:
+            days_left = (end_dt - now).total_seconds() / 86400
+            is_long_shot = prob <= low
+
             signals.append({
                 "question": m.get("question", "Unknown"),
                 "probability": prob,
                 "liquidity": liquidity,
                 "url": build_market_url(m),
                 "category": m.get("category", m.get("tags", [""])[0] if m.get("tags") else ""),
-                "end_date": m.get("endDate", m.get("endDateIso", "")),
-                "signal_type": "LONG SHOT 🎰" if prob <= low else "NEAR CERTAIN ✅",
+                "end_date": end_dt.strftime("%Y-%m-%d"),
+                "days_left": round(days_left, 1),
+                # Trade direction: long shot → BUY YES (expect up), near certain → BUY NO (expect down)
+                "direction": "BUY YES ↑" if is_long_shot else "BUY NO ↓",
+                "signal_type": "LONG SHOT 🎰" if is_long_shot else "NEAR CERTAIN ✅",
             })
 
-    signals.sort(key=lambda x: x["probability"])
+    # Sort by days remaining (soonest first), then by probability
+    signals.sort(key=lambda x: (x["days_left"], x["probability"]))
     return signals

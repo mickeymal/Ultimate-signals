@@ -70,31 +70,23 @@ def send_scan_summary(signals: list[dict], low: float, high: float, total_scanne
         return
 
     header = (
-        f"🚨 <b>POLYMARKET SIGNAL ALERT</b> 🚨\n\n"
-        f"Scanned <b>{total_scanned}</b> markets\n"
-        f"Found <b>{len(signals)}</b> extreme-probability signals\n"
-        f"Thresholds: &lt;{low}% (long shot) | &gt;{high}% (near certain)\n"
-        f"{'─' * 30}"
+        f"📊 <b>POLYMARKET SIGNALS</b>\n"
+        f"{len(signals)} short-term trades found | {total_scanned} markets scanned"
     )
     send_message(header)
     time.sleep(0.5)
 
-    # Group and send in batches of 10
-    batch_size = 10
-    for i in range(0, len(signals), batch_size):
-        batch = signals[i:i + batch_size]
-        lines = []
-        for s in batch:
-            end = f" | Ends: {s['end_date'][:10]}" if s.get("end_date") else ""
-            cat = f" [{html.escape(str(s['category']))}]" if s.get("category") else ""
-            question = html.escape(str(s["question"]))
-            lines.append(
-                f"{s['signal_type']}\n"
-                f"<b>{question}</b>{cat}\n"
-                f"Probability: <b>{s['probability']}%</b> | "
-                f"Liquidity: ${s['liquidity']:,.0f}{end}\n"
-                f"🔗 <a href=\"{s['url']}\">View Market</a>\n"
-                f"{'─' * 30}"
-            )
-        send_message("\n".join(lines))
-        time.sleep(0.8)
+    # Send one signal per message so each is clean and actionable
+    for s in signals:
+        question = html.escape(str(s["question"]))
+        days = s.get("days_left", "?")
+        days_str = f"{days}d" if isinstance(days, float) and days >= 1 else f"{round(days * 24)}h"
+        send_message(
+            f"{s['signal_type']}  <b>{s['direction']}</b>\n"
+            f"<b>{question}</b>\n"
+            f"Prob: <b>{s['probability']}%</b>  |  "
+            f"Liquidity: <b>${s['liquidity']:,.0f}</b>  |  "
+            f"Expires: <b>{days_str}</b>\n"
+            f"🔗 <a href=\"{s['url']}\">{s['url']}</a>"
+        )
+        time.sleep(0.4)
