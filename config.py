@@ -9,7 +9,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # Only signal when AI confidence is at or above this percentage
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "85"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "50"))
 
 # Max markets to run AI analysis on per scan (controls API cost)
 MAX_ANALYSIS_PER_SCAN = int(os.getenv("MAX_ANALYSIS_PER_SCAN", "100"))
