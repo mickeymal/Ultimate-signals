@@ -12,7 +12,14 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "85"))
 
 # Max markets to run AI analysis on per scan (controls API cost)
-MAX_ANALYSIS_PER_SCAN = int(os.getenv("MAX_ANALYSIS_PER_SCAN", "300"))
+MAX_ANALYSIS_PER_SCAN = int(os.getenv("MAX_ANALYSIS_PER_SCAN", "100"))
+
+# Comma-separated Polymarket categories to skip (sports have no AI edge)
+EXCLUDED_CATEGORIES = [
+    c.strip().lower()
+    for c in os.getenv("EXCLUDED_CATEGORIES", "sports").split(",")
+    if c.strip()
+]
 
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
 
