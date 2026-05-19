@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Polymarket Signal Bot
-Scans every active Polymarket market and alerts via Telegram when a market
-has an unrealistically low or near-certain probability.
+Scans all short-term Polymarket markets, analyses each with Claude + web search,
+and sends Telegram alerts only when AI confidence >= CONFIDENCE_THRESHOLD.
 """
 
 import logging
@@ -13,12 +13,14 @@ import schedule
 from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
-    LOW_THRESHOLD,
-    HIGH_THRESHOLD,
+    ANTHROPIC_API_KEY,
+    CONFIDENCE_THRESHOLD,
     SCAN_INTERVAL_MINUTES,
+    MAX_DAYS_TO_EXPIRY,
 )
-from polymarket import fetch_all_markets, filter_signal_markets
-from telegram_bot import send_message, send_scan_summary
+from polymarket import fetch_all_markets, get_short_term_markets
+from analyzer import analyse_markets
+from telegram_bot import send_message, send_signals
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,59 +34,65 @@ logger = logging.getLogger(__name__)
 
 
 def validate_config() -> bool:
+    ok = True
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "your_bot_token_here":
-        logger.error("TELEGRAM_BOT_TOKEN is not set. Copy .env.example to .env and fill it in.")
-        return False
+        logger.error("TELEGRAM_BOT_TOKEN is not set.")
+        ok = False
     if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "your_chat_id_here":
         logger.error("TELEGRAM_CHAT_ID is not set.")
-        return False
-    return True
+        ok = False
+    if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "your_anthropic_key_here":
+        logger.error("ANTHROPIC_API_KEY is not set.")
+        ok = False
+    return ok
 
 
 def run_scan() -> None:
-    logger.info(
-        "Running scan — thresholds: LOW=%.1f%% HIGH=%.1f%%",
-        LOW_THRESHOLD, HIGH_THRESHOLD,
-    )
+    logger.info("Starting scan cycle")
     try:
-        markets = fetch_all_markets()
-        if not markets:
-            logger.warning("No markets returned from Polymarket API.")
-            send_message("⚠️ Polymarket scan returned 0 markets — API may be down.")
+        all_markets = fetch_all_markets()
+        if not all_markets:
+            send_message("⚠️ Polymarket returned 0 markets — API may be down.")
             return
 
-        signals = filter_signal_markets(markets, LOW_THRESHOLD, HIGH_THRESHOLD)
+        short_term = get_short_term_markets(all_markets)
         logger.info(
-            "Scan complete: %d total markets, %d signals found",
-            len(markets), len(signals),
+            "%d total markets → %d short-term candidates (≤%dd, ≥$%.0f liquidity)",
+            len(all_markets), len(short_term), MAX_DAYS_TO_EXPIRY, 500,
         )
-        send_scan_summary(signals, LOW_THRESHOLD, HIGH_THRESHOLD, len(markets))
+
+        if not short_term:
+            send_message("🔍 No short-term markets found this scan.")
+            return
+
+        signals = analyse_markets(short_term)
+        send_signals(signals, len(all_markets), len(short_term))
 
     except Exception:
         logger.exception("Unexpected error during scan")
-        send_message("❌ Polymarket bot encountered an error during scan. Check logs.")
+        send_message("❌ Bot encountered an error during scan. Check logs.")
 
 
 def main() -> None:
     if not validate_config():
         sys.exit(1)
 
-    logger.info("Polymarket Signal Bot starting up")
-    logger.info("Scan interval: every %d minutes", SCAN_INTERVAL_MINUTES)
-    logger.info("Signal thresholds: <%.1f%% or >%.1f%%", LOW_THRESHOLD, HIGH_THRESHOLD)
+    logger.info("Polymarket Signal Bot starting")
+    logger.info("Confidence threshold: %.0f%%", CONFIDENCE_THRESHOLD)
+    logger.info("Max expiry: %d days | Scan every %d min", MAX_DAYS_TO_EXPIRY, SCAN_INTERVAL_MINUTES)
 
     send_message(
         f"🤖 <b>Polymarket Signal Bot Online</b>\n\n"
-        f"Scanning <b>all</b> Polymarket markets every <b>{SCAN_INTERVAL_MINUTES} min</b>\n"
-        f"Alerting when probability &lt; <b>{LOW_THRESHOLD}%</b> or &gt; <b>{HIGH_THRESHOLD}%</b>\n\n"
+        f"AI-powered analysis · {CONFIDENCE_THRESHOLD:.0f}%+ confidence only\n"
+        f"Short-term trades ≤ {MAX_DAYS_TO_EXPIRY} days · Scans every {SCAN_INTERVAL_MINUTES} min\n\n"
         f"Running first scan now..."
     )
 
     run_scan()
 
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_scan)
-
     logger.info("Scheduler started. Next scan in %d minutes.", SCAN_INTERVAL_MINUTES)
+
     while True:
         schedule.run_pending()
         time.sleep(30)

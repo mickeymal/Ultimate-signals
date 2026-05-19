@@ -21,7 +21,6 @@ def _get(url: str, params: dict) -> dict | None:
     for attempt in range(4):
         try:
             resp = SESSION.get(url, params=params, timeout=30)
-            # 422 at high offsets means we've hit the API's pagination limit — not an error
             if resp.status_code == 422:
                 logger.info("Reached API pagination limit at offset=%s", params.get("offset"))
                 return None
@@ -36,10 +35,8 @@ def _get(url: str, params: dict) -> dict | None:
 
 
 def fetch_all_markets() -> list[dict]:
-    """Fetch every active, non-closed binary market from Polymarket Gamma API."""
     markets = []
     offset = 0
-
     logger.info("Starting full Polymarket scan...")
 
     while True:
@@ -55,57 +52,41 @@ def fetch_all_markets() -> list[dict]:
         if not data:
             break
 
-        # Gamma API returns a list directly
-        if isinstance(data, list):
-            batch = data
-        else:
-            batch = data.get("data", data.get("markets", []))
-
+        batch = data if isinstance(data, list) else data.get("data", data.get("markets", []))
         if not batch:
             break
 
         markets.extend(batch)
-        logger.info("Fetched %d markets so far (page offset=%d)", len(markets), offset)
+        logger.info("Fetched %d markets (offset=%d)", len(markets), offset)
 
         if len(batch) < PAGE_SIZE:
-            # Last page
             break
 
         offset += PAGE_SIZE
-        time.sleep(0.3)  # polite rate limiting
+        time.sleep(0.3)
 
     logger.info("Total markets fetched: %d", len(markets))
     return markets
 
 
-def extract_probability(market: dict) -> float | None:
-    """
-    Return the YES probability (0-100) for a binary market.
-    Returns None if the market is not binary or price data is missing.
-    """
-    # outcomePrices is a JSON-encoded list of prices e.g. '["0.95", "0.05"]'
+def _extract_probability(market: dict) -> float | None:
     outcome_prices = market.get("outcomePrices")
     if not outcome_prices:
         return None
-
     if isinstance(outcome_prices, str):
         try:
             outcome_prices = json.loads(outcome_prices)
         except (ValueError, TypeError):
             return None
-
     if not isinstance(outcome_prices, list) or len(outcome_prices) < 1:
         return None
-
     try:
-        yes_price = float(outcome_prices[0])
-        return round(yes_price * 100, 2)
+        return round(float(outcome_prices[0]) * 100, 2)
     except (ValueError, TypeError):
         return None
 
 
-def extract_liquidity(market: dict) -> float:
-    """Return liquidity in USD, defaulting to 0."""
+def _extract_liquidity(market: dict) -> float:
     for key in ("liquidity", "liquidityNum", "volume"):
         val = market.get(key)
         if val is not None:
@@ -116,74 +97,50 @@ def extract_liquidity(market: dict) -> float:
     return 0.0
 
 
-def build_market_url(market: dict) -> str:
-    slug = market.get("slug") or market.get("conditionId", "")
-    return f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
-
-
 def _parse_end_date(market: dict) -> datetime | None:
     raw = market.get("endDate") or market.get("endDateIso") or market.get("end_date_iso")
     if not raw:
         return None
-    # Strip trailing Z, handle +00:00
-    raw = str(raw).replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(raw).astimezone(timezone.utc)
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(timezone.utc)
     except (ValueError, TypeError):
         return None
 
 
-def days_until_expiry(market: dict) -> float | None:
-    end = _parse_end_date(market)
-    if end is None:
-        return None
-    delta = end - datetime.now(timezone.utc)
-    return delta.total_seconds() / 86400
+def _build_url(market: dict) -> str:
+    slug = market.get("slug") or market.get("conditionId", "")
+    return f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
 
 
-def filter_signal_markets(markets: list[dict], low: float, high: float) -> list[dict]:
+def get_short_term_markets(markets: list[dict]) -> list[dict]:
     """
-    Return short-term markets (≤ MAX_DAYS_TO_EXPIRY) whose YES probability is
-    extreme — either a long shot (≤ low%) or near-certain (≥ high%).
+    Filter to active markets expiring within MAX_DAYS_TO_EXPIRY with
+    sufficient liquidity. Sorted by liquidity desc so the most active
+    markets are analysed first.
     """
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(days=MAX_DAYS_TO_EXPIRY)
-    signals = []
+    result = []
 
     for m in markets:
-        prob = extract_probability(m)
-        if prob is None:
-            continue
-
-        liquidity = extract_liquidity(m)
+        liquidity = _extract_liquidity(m)
         if liquidity < MIN_LIQUIDITY:
             continue
 
         end_dt = _parse_end_date(m)
-        # Skip markets with no end date or expiring too far out
-        if end_dt is None or end_dt > cutoff:
-            continue
-        # Skip already-expired markets
-        if end_dt <= now:
+        if end_dt is None or end_dt > cutoff or end_dt <= now:
             continue
 
-        if prob <= low or prob >= high:
-            days_left = (end_dt - now).total_seconds() / 86400
-            is_long_shot = prob <= low
+        days_left = (end_dt - now).total_seconds() / 86400
+        result.append({
+            "question": m.get("question", "Unknown"),
+            "polymarket_prob": _extract_probability(m),
+            "liquidity": liquidity,
+            "url": _build_url(m),
+            "category": m.get("category", (m.get("tags") or [""])[0]),
+            "end_date": end_dt.strftime("%Y-%m-%d"),
+            "days_left": round(days_left, 1),
+        })
 
-            signals.append({
-                "question": m.get("question", "Unknown"),
-                "probability": prob,
-                "liquidity": liquidity,
-                "url": build_market_url(m),
-                "category": m.get("category", m.get("tags", [""])[0] if m.get("tags") else ""),
-                "end_date": end_dt.strftime("%Y-%m-%d"),
-                "days_left": round(days_left, 1),
-                # Trade direction: long shot → BUY YES (expect up), near certain → BUY NO (expect down)
-                "direction": "BUY YES ↑" if is_long_shot else "BUY NO ↓",
-                "signal_type": "LONG SHOT 🎰" if is_long_shot else "NEAR CERTAIN ✅",
-            })
-
-    # Sort by days remaining (soonest first), then by probability
-    signals.sort(key=lambda x: (x["days_left"], x["probability"]))
-    return signals
+    result.sort(key=lambda x: x["liquidity"], reverse=True)
+    return result
