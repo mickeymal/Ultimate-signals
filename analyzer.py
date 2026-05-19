@@ -120,14 +120,62 @@ def _is_hallucinated(reason: str) -> bool:
     return any(phrase in lower for phrase in _NO_DATA_PHRASES)
 
 
-def _is_excluded_category(market: dict) -> bool:
+# Question-level patterns that indicate a sports market regardless of category tag.
+# These are match-outcome questions where the AI has no edge without live data.
+_SPORTS_PATTERNS = (
+    " vs. ",
+    " vs ",
+    "end in a draw",
+    "end in a tie",
+    "win on 20",        # "Will X win on 2026-..."
+    "win on 2025",
+    "total goals",
+    "score more than",
+    "score less than",
+    "first goal",
+    "clean sheet",
+    "yellow card",
+    "red card",
+    "match result",
+    "half-time",
+    "halftime",
+    " fc ",
+    " afc ",
+    " fc win",
+    "nba ",
+    "nfl ",
+    "mlb ",
+    "nhl ",
+    "ufc ",
+    "boxing",
+    "grand prix",
+    "formula 1",
+    " f1 ",
+    "tennis",
+    "golf tournament",
+    "super bowl",
+    "world cup",
+    "champions league",
+    "premier league",
+    "la liga",
+    "bundesliga",
+    "serie a",
+    "ligue 1",
+)
+
+
+def _should_skip(market: dict) -> bool:
+    """Return True if the market is sports-based or otherwise not googleable."""
     cat = str(market.get("category", "")).lower()
-    return any(excl in cat for excl in EXCLUDED_CATEGORIES)
+    if any(excl in cat for excl in EXCLUDED_CATEGORIES):
+        return True
+    q = str(market.get("question", "")).lower()
+    return any(pat in q for pat in _SPORTS_PATTERNS)
 
 
 def analyse_markets(markets: list[dict]) -> list[dict]:
-    # Filter out excluded categories before we start
-    eligible = [m for m in markets if not _is_excluded_category(m)]
+    # Filter out sports and un-googleable markets before we start
+    eligible = [m for m in markets if not _should_skip(m)]
     excluded_count = len(markets) - len(eligible)
     if excluded_count:
         logger.info("Skipped %d markets in excluded categories (%s)", excluded_count, EXCLUDED_CATEGORIES)
