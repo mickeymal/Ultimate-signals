@@ -19,7 +19,7 @@ from config import (
     MAX_DAYS_TO_EXPIRY,
     TOP_TRADERS_COUNT,
 )
-from polymarket import fetch_all_markets, get_signal_markets
+from polymarket import fetch_short_term_markets, get_signal_markets
 from tracker import TraderTracker
 from telegram_bot import (
     send_message,
@@ -58,13 +58,13 @@ def validate_config() -> bool:
 def run_market_scan() -> None:
     logger.info("Running market scan (≤%d day markets)...", MAX_DAYS_TO_EXPIRY)
     try:
-        all_markets = fetch_all_markets()
+        all_markets = fetch_short_term_markets()
         if not all_markets:
-            logger.warning("No markets returned from Polymarket API.")
+            logger.warning("No short-term markets returned from Polymarket API.")
             return
 
         signals = get_signal_markets(all_markets)
-        logger.info("%d signal markets found from %d total", len(signals), len(all_markets))
+        logger.info("%d signal markets found from %d short-term", len(signals), len(all_markets))
 
         if not signals:
             send_no_signals(len(all_markets))

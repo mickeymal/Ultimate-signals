@@ -19,9 +19,13 @@ HEADERS = {
 }
 
 _LEADERBOARD_URLS = [
-    f"{DATA_API_BASE}/profiles?limit={TOP_TRADERS_COUNT}&sortBy=pnl&sortDirection=desc",
-    f"https://polymarket.com/api/profiles/leaderboard?limit={TOP_TRADERS_COUNT}&window=all",
+    f"{DATA_API_BASE}/leaderboard?limit={TOP_TRADERS_COUNT}&window=all",
     f"{DATA_API_BASE}/leaderboard?limit={TOP_TRADERS_COUNT}",
+    f"{DATA_API_BASE}/profiles?limit={TOP_TRADERS_COUNT}&sortBy=pnl&sortDirection=desc",
+    f"{DATA_API_BASE}/profiles?limit={TOP_TRADERS_COUNT}&sort=profit",
+    f"https://polymarket.com/api/profiles/leaderboard?limit={TOP_TRADERS_COUNT}&window=all",
+    f"https://polymarket.com/api/leaderboard?limit={TOP_TRADERS_COUNT}",
+    f"https://gamma-api.polymarket.com/leaderboard?limit={TOP_TRADERS_COUNT}",
 ]
 
 _ACTIVITY_URLS = [
@@ -62,13 +66,28 @@ def get_top_traders() -> list[dict]:
         data = _get(url)
         if not data:
             continue
-        raw = data if isinstance(data, list) else data.get("data", data.get("profiles", data.get("results", [])))
+        raw = data if isinstance(data, list) else (
+            data.get("data") or data.get("profiles") or
+            data.get("results") or data.get("leaderboard") or []
+        )
         traders = _normalize_traders(raw)
         if traders:
-            logger.info("Loaded %d top traders from leaderboard", len(traders))
+            logger.info("Loaded %d top traders from: %s", len(traders), url)
             return traders[:TOP_TRADERS_COUNT]
+        logger.debug("URL returned data but no traders: %s | keys=%s", url, list(data.keys()) if isinstance(data, dict) else type(data))
 
-    logger.warning("Could not load leaderboard — all endpoints failed")
+    # Manual fallback: read addresses from TRADER_ADDRESSES env var
+    # Set it in Railway as a comma-separated list of proxy wallet addresses
+    import os
+    manual = [a.strip() for a in os.getenv("TRADER_ADDRESSES", "").split(",") if a.strip()]
+    if manual:
+        logger.info("Using %d manually configured trader addresses", len(manual))
+        return [{"address": a, "name": f"{a[:6]}...{a[-4:]}", "pnl": 0} for a in manual]
+
+    logger.warning(
+        "Leaderboard unavailable. Set TRADER_ADDRESSES in Railway with comma-separated "
+        "Polymarket proxy wallet addresses to track specific traders."
+    )
     return []
 
 

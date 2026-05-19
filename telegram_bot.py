@@ -65,23 +65,31 @@ def _outcome_line(outcomes: list[tuple[str, float]]) -> str:
 
 
 def send_market_signal(market: dict) -> bool:
-    """Send one market signal message formatted like the Polymarket app."""
+    """Send one market signal formatted like the Polymarket app screenshot."""
     outcomes = market["outcomes"]
-    direction = html.escape(market["signal_direction"])
-    price = market["signal_price"]
+    cheap_name = market["cheapest_name"].upper()
+    cheap_price = market["cheapest_price"]
+    likely_name = market["most_likely_name"].upper()
+    likely_price = market["most_likely_price"]
     question = html.escape(market["question"])
     expires = market["expires_str"]
     liquidity = market["liquidity"]
     url = market["url"]
 
-    arrow = "⬆️" if direction in ("YES", "UP") else "⬇️"
+    # Payout if cheap side wins (e.g. 7¢ in → win ~93¢ = ~13x)
+    payout = round(100 / cheap_price, 1) if cheap_price > 0 else 0
+    profit = round(100 - cheap_price, 1)
+
+    cheap_arrow = "⬆️" if cheap_name in ("UP", "YES") else "⬇️"
+    likely_arrow = "⬇️" if cheap_name in ("UP", "YES") else "⬆️"
 
     text = (
-        f"⚡ <b>MARKET SIGNAL</b>\n"
-        f"<b>{question}</b>\n\n"
-        f"{_outcome_line(outcomes)}\n\n"
-        f"Signal: {arrow} <b>BUY {direction}</b> @ <b>{price:.0f}¢</b>\n"
-        f"💧 Liquidity: <b>${liquidity:,.0f}</b>  |  ⏱ Expires: <b>{expires}</b>\n"
+        f"⚡ <b>{question}</b>\n\n"
+        f"{cheap_arrow} <b>{cheap_name}</b>: <b>{cheap_price:.0f}¢</b>  "
+        f"{likely_arrow} <b>{likely_name}</b>: <b>{likely_price:.0f}¢</b>\n\n"
+        f"🎯 Signal: {cheap_arrow} <b>BUY {cheap_name}</b>\n"
+        f"    Stake <b>$1</b> → win <b>${payout}</b>  (+{profit:.0f}¢ profit)\n\n"
+        f"💧 <b>${liquidity:,.0f}</b> liquidity  ·  ⏱ Expires <b>{expires}</b>\n"
         f"🔗 <a href=\"{url}\">{url}</a>"
     )
     return send_message(text)

@@ -15,6 +15,10 @@ MAX_DAYS_TO_EXPIRY = int(os.getenv("MAX_DAYS_TO_EXPIRY", "1"))
 # Minimum liquidity in USD
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "100"))
 
+# Manually tracked trader addresses (comma-separated proxy wallet addresses)
+# Used as fallback if the leaderboard API is unavailable
+TRADER_ADDRESSES = os.getenv("TRADER_ADDRESSES", "")
+
 # Top trader tracking
 TOP_TRADERS_COUNT = int(os.getenv("TOP_TRADERS_COUNT", "25"))
 TRACKER_POLL_MINUTES = int(os.getenv("TRACKER_POLL_MINUTES", "3"))
