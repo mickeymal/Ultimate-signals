@@ -16,21 +16,16 @@ HEADERS = {
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
-# Queries tried in order — stop at first that returns BTC up/down markets
-_SEARCH_QUERIES = [
-    "BTC Up or Down",
-    "up or down",
-    "BTC",
-]
-
 
 def _get(url: str, params: dict) -> list | dict | None:
-    for attempt in range(4):
+    for attempt in range(3):
         try:
             resp = SESSION.get(url, params=params, timeout=30)
             if resp.status_code in (422, 404):
                 return None
-            resp.raise_for_status()
+            if not resp.ok:
+                logger.debug("API %s → HTTP %d", url.split("?")[0], resp.status_code)
+                return None
             return resp.json()
         except requests.RequestException as e:
             wait = 2 ** attempt
@@ -42,8 +37,8 @@ def _get(url: str, params: dict) -> list | dict | None:
 def _is_btc_updown(question: str) -> bool:
     q = question.lower()
     has_btc = "btc" in q or "bitcoin" in q
-    has_updown = "up or down" in q or "up/down" in q
-    has_timeframe = any(kw in q for kw in ("15m", "5m", "10m", "15 min", "5 min", "10 min"))
+    has_updown = "up or down" in q or "up/down" in q or "higher or lower" in q
+    has_timeframe = any(kw in q for kw in ("15m", "5m", "10m", "15 min", "5 min", "10 min", "15-min", "5-min"))
     return has_btc and (has_updown or has_timeframe)
 
 
@@ -99,79 +94,110 @@ def _expires_str(seconds: float) -> str:
     return f"{h}h {m}m"
 
 
+def _scan_markets_batch(batch: list[dict], seen_ids: set, now: datetime, slug_override: str = "") -> list[dict]:
+    found = []
+    for m in batch:
+        question = m.get("question", "")
+        if not _is_btc_updown(question):
+            continue
+        end_dt = _parse_end_date(m)
+        if end_dt is None or end_dt <= now:
+            continue
+        mid = str(m.get("id") or m.get("conditionId") or question)
+        if mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+        m["_slug"] = slug_override or m.get("slug") or m.get("eventSlug") or m.get("groupSlug") or ""
+        found.append(m)
+    return found
+
+
 def fetch_btc_updown_markets() -> list[dict]:
-    """Search Polymarket for active BTC Up/Down short-term markets only."""
+    """
+    Search for active BTC Up/Down short-term markets.
+    Tries multiple API approaches with detailed logging for debugging.
+    """
     now = datetime.now(timezone.utc)
-    found: list[dict] = []
     seen_ids: set[str] = set()
 
-    for query in _SEARCH_QUERIES:
-        params = {
-            "active": "true",
-            "closed": "false",
-            "q": query,
-            "limit": 50,
-        }
-        data = _get(f"{GAMMA_API_BASE}/markets", params)
-        if not data:
-            logger.debug("No data for query %r", query)
-            continue
-
+    # ── Attempt 1: /markets sorted by endDate ascending ─────────────────────
+    # BTC 15m markets expire soonest, so they appear first in this sort
+    data = _get(f"{GAMMA_API_BASE}/markets", {
+        "active": "true", "closed": "false",
+        "order": "endDate", "ascending": "true", "limit": 50,
+    })
+    if data:
         batch = data if isinstance(data, list) else data.get("data", [])
-        logger.debug("Query %r → %d raw markets", query, len(batch))
-
-        for m in batch:
-            question = m.get("question", "")
-            if not _is_btc_updown(question):
-                continue
-
-            end_dt = _parse_end_date(m)
-            if end_dt is None or end_dt <= now:
-                continue
-
-            market_id = str(m.get("id") or m.get("conditionId") or question)
-            if market_id in seen_ids:
-                continue
-            seen_ids.add(market_id)
-
-            # Build event URL from slug or groupItemTitle
-            slug = m.get("slug") or m.get("eventSlug") or ""
-            if not slug:
-                # Try to derive from market groupSlug or market slug
-                slug = m.get("groupSlug") or ""
-            m["_slug"] = slug
-            found.append(m)
-
+        logger.info("[A1] /markets?order=endDate&asc → %d markets | first: %s",
+                    len(batch), batch[0].get("question", "?")[:60] if batch else "none")
+        found = _scan_markets_batch(batch, seen_ids, now)
         if found:
-            logger.info("Found %d BTC up/down markets via query %r", len(found), query)
-            break
+            logger.info("Found %d BTC up/down markets via attempt 1", len(found))
+            return found
+    else:
+        logger.info("[A1] /markets?order=endDate&asc → no response")
 
+    # ── Attempt 2: /events sorted by endDate ascending ───────────────────────
+    data = _get(f"{GAMMA_API_BASE}/events", {
+        "active": "true", "closed": "false",
+        "order": "endDate", "ascending": "true", "limit": 30,
+    })
+    if data:
+        batch = data if isinstance(data, list) else data.get("data", [])
+        logger.info("[A2] /events?order=endDate&asc → %d events | first: %s",
+                    len(batch), batch[0].get("title", batch[0].get("slug", "?"))[:60] if batch else "none")
+        found = []
+        for event in batch:
+            slug = event.get("slug", "")
+            markets = event.get("markets", [event])
+            found += _scan_markets_batch(markets, seen_ids, now, slug)
+        if found:
+            logger.info("Found %d BTC up/down markets via attempt 2", len(found))
+            return found
+    else:
+        logger.info("[A2] /events?order=endDate&asc → no response")
+
+    # ── Attempt 3: /events first page, no sort ───────────────────────────────
+    data = _get(f"{GAMMA_API_BASE}/events", {
+        "active": "true", "closed": "false", "limit": 100,
+    })
+    if data:
+        batch = data if isinstance(data, list) else data.get("data", [])
+        logger.info("[A3] /events (no sort) → %d events | first: %s",
+                    len(batch), batch[0].get("title", batch[0].get("slug", "?"))[:60] if batch else "none")
+        found = []
+        for event in batch:
+            slug = event.get("slug", "")
+            markets = event.get("markets", [event])
+            found += _scan_markets_batch(markets, seen_ids, now, slug)
+        if found:
+            logger.info("Found %d BTC up/down markets via attempt 3", len(found))
+            return found
+    else:
+        logger.info("[A3] /events (no sort) → no response")
+
+    # ── Attempt 4: /markets first 3 pages ────────────────────────────────────
+    for offset in (0, 100, 200):
+        data = _get(f"{GAMMA_API_BASE}/markets", {
+            "active": "true", "closed": "false", "limit": 100, "offset": offset,
+        })
+        if not data:
+            logger.info("[A4] /markets offset=%d → no response", offset)
+            break
+        batch = data if isinstance(data, list) else data.get("data", [])
+        logger.info("[A4] /markets offset=%d → %d markets | first: %s",
+                    offset, len(batch),
+                    batch[0].get("question", "?")[:60] if batch else "none")
+        found = _scan_markets_batch(batch, seen_ids, now)
+        if found:
+            logger.info("Found %d BTC up/down markets via attempt 4 (offset=%d)", len(found), offset)
+            return found
+        if len(batch) < 100:
+            break
         time.sleep(0.3)
 
-    if not found:
-        # Last-ditch: try /events endpoint with keyword
-        params = {"active": "true", "closed": "false", "q": "BTC up or down", "limit": 20}
-        data = _get(f"{GAMMA_API_BASE}/events", params)
-        if data:
-            batch = data if isinstance(data, list) else data.get("data", [])
-            for event in batch:
-                slug = event.get("slug", "")
-                for m in event.get("markets", []):
-                    question = m.get("question", "")
-                    if not _is_btc_updown(question):
-                        continue
-                    end_dt = _parse_end_date(m)
-                    if end_dt is None or end_dt <= now:
-                        continue
-                    market_id = str(m.get("id") or m.get("conditionId") or question)
-                    if market_id in seen_ids:
-                        continue
-                    seen_ids.add(market_id)
-                    m["_slug"] = slug
-                    found.append(m)
-
-    logger.info("fetch_btc_updown_markets → %d active markets", len(found))
-    return found
+    logger.warning("fetch_btc_updown_markets → 0 markets found across all attempts")
+    return []
 
 
 def get_signal_markets(markets: list[dict]) -> list[dict]:
