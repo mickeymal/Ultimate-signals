@@ -1,3 +1,4 @@
+import html
 import logging
 import time
 import requests
@@ -85,10 +86,11 @@ def send_scan_summary(signals: list[dict], low: float, high: float, total_scanne
         lines = []
         for s in batch:
             end = f" | Ends: {s['end_date'][:10]}" if s.get("end_date") else ""
-            cat = f" [{s['category']}]" if s.get("category") else ""
+            cat = f" [{html.escape(str(s['category']))}]" if s.get("category") else ""
+            question = html.escape(str(s["question"]))
             lines.append(
                 f"{s['signal_type']}\n"
-                f"<b>{s['question']}</b>{cat}\n"
+                f"<b>{question}</b>{cat}\n"
                 f"Probability: <b>{s['probability']}%</b> | "
                 f"Liquidity: ${s['liquidity']:,.0f}{end}\n"
                 f"🔗 <a href=\"{s['url']}\">View Market</a>\n"

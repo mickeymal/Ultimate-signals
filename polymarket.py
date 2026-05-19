@@ -19,6 +19,10 @@ def _get(url: str, params: dict) -> dict | None:
     for attempt in range(4):
         try:
             resp = SESSION.get(url, params=params, timeout=30)
+            # 422 at high offsets means we've hit the API's pagination limit — not an error
+            if resp.status_code == 422:
+                logger.info("Reached API pagination limit at offset=%s", params.get("offset"))
+                return None
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as e:
