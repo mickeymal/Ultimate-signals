@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Polymarket Signal Bot
-- Scans all short-term markets every SCAN_INTERVAL_MINUTES and sends signals immediately.
-- Tracks the top 25 most profitable traders every TRACKER_POLL_MINUTES and alerts on every trade.
+- Scans BTC short-term markets (Up/Down 15m etc) every SCAN_INTERVAL_MINUTES.
+- Tracks top-25 traders; if leaderboard unavailable, falls back to BTC mempool watching.
 """
 
 import logging
@@ -21,12 +21,14 @@ from config import (
 )
 from polymarket import fetch_short_term_markets, get_signal_markets
 from tracker import TraderTracker
+from btc_watcher import BTCWatcher
 from telegram_bot import (
     send_message,
     send_market_signal,
     send_batch_header,
     send_no_signals,
     send_trader_signal,
+    send_btc_signal,
 )
 
 logging.basicConfig(
@@ -40,6 +42,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _trader_tracker = TraderTracker()
+_btc_watcher = BTCWatcher()
+_use_btc_watcher = False   # flips True if leaderboard fails
 
 
 def validate_config() -> bool:
@@ -56,23 +60,22 @@ def validate_config() -> bool:
 # ── Market scanner ────────────────────────────────────────────────────────────
 
 def run_market_scan() -> None:
-    logger.info("Running market scan (≤%d day markets)...", MAX_DAYS_TO_EXPIRY)
+    logger.info("Running market scan (≤%s day markets)...", MAX_DAYS_TO_EXPIRY)
     try:
-        all_markets = fetch_short_term_markets()
-        if not all_markets:
-            logger.warning("No short-term markets returned from Polymarket API.")
+        markets = fetch_short_term_markets()
+        if not markets:
+            logger.info("No short-term markets found.")
             return
 
-        signals = get_signal_markets(all_markets)
-        logger.info("%d signal markets found from %d short-term", len(signals), len(all_markets))
+        signals = get_signal_markets(markets)
+        logger.info("%d signal markets from %d fetched", len(signals), len(markets))
 
         if not signals:
-            send_no_signals(len(all_markets))
+            send_no_signals(len(markets))
             return
 
-        send_batch_header(len(signals), len(all_markets))
+        send_batch_header(len(signals), len(markets))
         time.sleep(0.5)
-
         for s in signals:
             send_market_signal(s)
             time.sleep(0.4)
@@ -81,72 +84,96 @@ def run_market_scan() -> None:
         logger.exception("Error during market scan")
 
 
-# ── Trader tracker ────────────────────────────────────────────────────────────
+# ── Trader / BTC watcher loop ─────────────────────────────────────────────────
 
-def run_trader_check() -> None:
-    logger.info("Checking top trader activity...")
-    try:
-        new_trades = _trader_tracker.check_new_trades()
-        if not new_trades:
-            logger.info("No new trader activity")
-            return
+def _watcher_loop() -> None:
+    """
+    Background thread: either polls top traders OR watches the BTC mempool.
+    Switches to BTC watcher automatically if the leaderboard never loads.
+    """
+    global _use_btc_watcher
 
-        logger.info("%d new trader trades found — alerting now", len(new_trades))
-        for trade in new_trades:
-            send_trader_signal(trade)
-            time.sleep(0.3)
+    btc_poll_interval = 30   # seconds between mempool checks
 
-    except Exception:
-        logger.exception("Error during trader check")
-
-
-def _trader_loop() -> None:
-    """Run the trader tracker on its own tight loop in a background thread."""
     while True:
-        run_trader_check()
-        time.sleep(TRACKER_POLL_MINUTES * 60)
+        if _use_btc_watcher:
+            signal = _btc_watcher.check()
+            if signal:
+                # Find the current BTC 15m market URL to attach
+                _send_btc_onchain_signal(signal)
+            time.sleep(btc_poll_interval)
+        else:
+            # Try trader check
+            try:
+                new_trades = _trader_tracker.check_new_trades()
+                for trade in new_trades:
+                    send_trader_signal(trade)
+                    time.sleep(0.3)
+            except Exception:
+                logger.exception("Trader check error")
+            time.sleep(TRACKER_POLL_MINUTES * 60)
+
+
+def _send_btc_onchain_signal(signal: dict) -> None:
+    """Fetch the live BTC 15m market URL then send the on-chain signal."""
+    try:
+        markets = fetch_short_term_markets()
+        btc_market = next(
+            (m for m in get_signal_markets(markets)
+             if "btc" in m["question"].lower() and
+             any(kw in m["question"].lower() for kw in ("up or down", "up/down", "15m", "15 min"))),
+            None,
+        )
+        url = btc_market["url"] if btc_market else "https://polymarket.com"
+        expires = btc_market["expires_str"] if btc_market else "~15m"
+    except Exception:
+        url = "https://polymarket.com"
+        expires = "~15m"
+
+    send_btc_signal(signal, url, expires)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global _use_btc_watcher
+
     if not validate_config():
         sys.exit(1)
 
     logger.info("Polymarket Signal Bot starting up")
-    logger.info(
-        "Market scan: every %d min | Trader poll: every %d min | Top traders: %d",
-        SCAN_INTERVAL_MINUTES, TRACKER_POLL_MINUTES, TOP_TRADERS_COUNT,
-    )
 
-    send_message(
-        f"🤖 <b>Polymarket Signal Bot Online</b>\n\n"
-        f"📊 Market signals: every <b>{SCAN_INTERVAL_MINUTES} min</b> "
-        f"(≤{MAX_DAYS_TO_EXPIRY}d markets)\n"
-        f"👤 Top <b>{TOP_TRADERS_COUNT}</b> traders monitored every <b>{TRACKER_POLL_MINUTES} min</b>\n\n"
-        f"Starting now..."
-    )
-
-    # Load leaderboard at startup
+    # Try to load top traders
     logger.info("Loading top %d traders...", TOP_TRADERS_COUNT)
     _trader_tracker.refresh_traders()
 
-    # First market scan immediately
+    if not _trader_tracker._traders:
+        _use_btc_watcher = True
+        logger.info("Leaderboard unavailable — switching to BTC mempool watcher")
+        send_message(
+            f"🤖 <b>Polymarket Signal Bot Online</b>\n\n"
+            f"📊 Market signals: every <b>{SCAN_INTERVAL_MINUTES} min</b>\n"
+            f"⛓ Leaderboard unavailable — watching <b>BTC mempool</b> instead\n"
+            f"   (fee spikes, whale txns, mempool drains → BTC 15m signals)\n\n"
+            f"Starting scan now..."
+        )
+    else:
+        send_message(
+            f"🤖 <b>Polymarket Signal Bot Online</b>\n\n"
+            f"📊 Market signals: every <b>{SCAN_INTERVAL_MINUTES} min</b>\n"
+            f"👤 Tracking top <b>{len(_trader_tracker._traders)}</b> traders "
+            f"every <b>{TRACKER_POLL_MINUTES} min</b>\n\n"
+            f"Starting scan now..."
+        )
+
     run_market_scan()
 
-    # First trader check immediately
-    run_trader_check()
-
-    # Schedule regular market scans on the main thread
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_market_scan)
-
-    # Refresh leaderboard once an hour
     schedule.every(60).minutes.do(_trader_tracker.refresh_traders)
 
-    # Trader checks run on a background thread so they never block market scans
-    t = threading.Thread(target=_trader_loop, daemon=True)
+    t = threading.Thread(target=_watcher_loop, daemon=True)
     t.start()
-    logger.info("Trader tracker running in background thread")
+    logger.info("Background watcher started (mode: %s)", "BTC mempool" if _use_btc_watcher else "trader tracker")
 
     while True:
         schedule.run_pending()

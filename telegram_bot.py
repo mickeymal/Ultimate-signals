@@ -134,6 +134,27 @@ def send_trader_signal(trade: dict) -> bool:
     return send_message(text)
 
 
+def send_btc_signal(signal: dict, market_url: str, expires: str) -> bool:
+    """On-chain mempool signal for the BTC Up/Down 15m market."""
+    direction = signal["direction"]
+    arrow = "⬆️" if direction == "UP" else "⬇️"
+    indicator = signal.get("indicator", "ON-CHAIN")
+    reason = html.escape(signal.get("reason", ""))
+    fee = signal.get("fast_fee", 0)
+    mempool = signal.get("mempool_count", 0)
+
+    text = (
+        f"⛓ <b>ON-CHAIN SIGNAL  →  BTC Up or Down 15m</b>\n\n"
+        f"🔍 <b>{indicator}</b>\n"
+        f"{reason}\n\n"
+        f"🎯 Signal: {arrow} <b>BUY {direction}</b>\n"
+        f"⏱ Act within next <b>2-3 minutes</b>  |  Market expires: <b>{expires}</b>\n\n"
+        f"📡 Fee: <b>{fee:.0f} sat/vB</b>  |  Mempool: <b>{mempool:,} txns</b>\n"
+        f"🔗 <a href=\"{market_url}\">{market_url}</a>"
+    )
+    return send_message(text)
+
+
 def send_no_signals(total_scanned: int) -> bool:
     return send_message(
         f"🔍 Scan complete — {total_scanned} markets checked, no short-term signals right now."
