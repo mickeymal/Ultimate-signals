@@ -2,8 +2,8 @@ import json
 import time
 import logging
 import requests
-from datetime import datetime, timezone, timedelta
-from config import GAMMA_API_BASE, MIN_LIQUIDITY, MAX_DAYS_TO_EXPIRY
+from datetime import datetime, timezone
+from config import GAMMA_API_BASE, MIN_LIQUIDITY
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +16,19 @@ HEADERS = {
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
+# Queries tried in order — stop at first that returns BTC up/down markets
+_SEARCH_QUERIES = [
+    "BTC Up or Down",
+    "up or down",
+    "BTC",
+]
+
 
 def _get(url: str, params: dict) -> list | dict | None:
     for attempt in range(4):
         try:
             resp = SESSION.get(url, params=params, timeout=30)
-            if resp.status_code == 422:
+            if resp.status_code in (422, 404):
                 return None
             resp.raise_for_status()
             return resp.json()
@@ -30,6 +37,14 @@ def _get(url: str, params: dict) -> list | dict | None:
             logger.warning("Request failed (attempt %d): %s — retrying in %ds", attempt + 1, e, wait)
             time.sleep(wait)
     return None
+
+
+def _is_btc_updown(question: str) -> bool:
+    q = question.lower()
+    has_btc = "btc" in q or "bitcoin" in q
+    has_updown = "up or down" in q or "up/down" in q
+    has_timeframe = any(kw in q for kw in ("15m", "5m", "10m", "15 min", "5 min", "10 min"))
+    return has_btc and (has_updown or has_timeframe)
 
 
 def _parse_outcomes(market: dict) -> list[tuple[str, float]]:
@@ -75,87 +90,92 @@ def _extract_liquidity(market: dict) -> float:
     return 0.0
 
 
-def _build_url(market: dict) -> str:
-    slug = market.get("_event_slug") or market.get("slug", "")
-    return f"https://polymarket.com/event/{slug}" if slug else ""
-
-
 def _expires_str(seconds: float) -> str:
     if seconds < 60:
         return f"{int(seconds)}s"
     if seconds < 3600:
         return f"{int(seconds // 60)}m"
-    if seconds < 86400:
-        h, m = int(seconds // 3600), int((seconds % 3600) // 60)
-        return f"{h}h {m}m"
-    return f"{round(seconds / 86400, 1)}d"
+    h, m = int(seconds // 3600), int((seconds % 3600) // 60)
+    return f"{h}h {m}m"
 
 
-def fetch_short_term_markets() -> list[dict]:
-    """
-    Fetch ONLY the soonest-expiring active markets by sorting endDate ascending
-    and stopping as soon as we've passed the MAX_DAYS_TO_EXPIRY cutoff.
-    Typically returns in 1-2 API calls instead of scanning 10k+ markets.
-    """
+def fetch_btc_updown_markets() -> list[dict]:
+    """Search Polymarket for active BTC Up/Down short-term markets only."""
     now = datetime.now(timezone.utc)
-    cutoff = now + timedelta(days=MAX_DAYS_TO_EXPIRY)
-    markets = []
-    offset = 0
+    found: list[dict] = []
+    seen_ids: set[str] = set()
 
-    logger.info("Fetching short-term markets (≤%.1f days)...", MAX_DAYS_TO_EXPIRY)
-
-    while True:
+    for query in _SEARCH_QUERIES:
         params = {
             "active": "true",
             "closed": "false",
-            "limit": 100,
-            "offset": offset,
-            "order": "endDate",       # sort soonest-ending first
-            "ascending": "true",
+            "q": query,
+            "limit": 50,
         }
-        data = _get(f"{GAMMA_API_BASE}/events", params)
+        data = _get(f"{GAMMA_API_BASE}/markets", params)
         if not data:
-            break
+            logger.debug("No data for query %r", query)
+            continue
 
         batch = data if isinstance(data, list) else data.get("data", [])
-        if not batch:
+        logger.debug("Query %r → %d raw markets", query, len(batch))
+
+        for m in batch:
+            question = m.get("question", "")
+            if not _is_btc_updown(question):
+                continue
+
+            end_dt = _parse_end_date(m)
+            if end_dt is None or end_dt <= now:
+                continue
+
+            market_id = str(m.get("id") or m.get("conditionId") or question)
+            if market_id in seen_ids:
+                continue
+            seen_ids.add(market_id)
+
+            # Build event URL from slug or groupItemTitle
+            slug = m.get("slug") or m.get("eventSlug") or ""
+            if not slug:
+                # Try to derive from market groupSlug or market slug
+                slug = m.get("groupSlug") or ""
+            m["_slug"] = slug
+            found.append(m)
+
+        if found:
+            logger.info("Found %d BTC up/down markets via query %r", len(found), query)
             break
 
-        hit_cutoff = False
-        for event in batch:
-            slug = event.get("slug", "")
-            url = f"https://polymarket.com/event/{slug}" if slug else ""
-            for m in event.get("markets", [event]):
-                end_dt = _parse_end_date(m)
-                if end_dt is None:
-                    continue
-                if end_dt > cutoff:
-                    hit_cutoff = True
-                    break
-                if end_dt > now:
-                    m["_event_url"] = url
-                    m["_event_slug"] = slug
-                    markets.append(m)
-            if hit_cutoff:
-                break
-
-        logger.info("Fetched %d short-term markets (offset=%d)", len(markets), offset)
-
-        if hit_cutoff or len(batch) < 100:
-            break
-
-        offset += 100
         time.sleep(0.3)
 
-    logger.info("Done — %d short-term markets found", len(markets))
-    return markets
+    if not found:
+        # Last-ditch: try /events endpoint with keyword
+        params = {"active": "true", "closed": "false", "q": "BTC up or down", "limit": 20}
+        data = _get(f"{GAMMA_API_BASE}/events", params)
+        if data:
+            batch = data if isinstance(data, list) else data.get("data", [])
+            for event in batch:
+                slug = event.get("slug", "")
+                for m in event.get("markets", []):
+                    question = m.get("question", "")
+                    if not _is_btc_updown(question):
+                        continue
+                    end_dt = _parse_end_date(m)
+                    if end_dt is None or end_dt <= now:
+                        continue
+                    market_id = str(m.get("id") or m.get("conditionId") or question)
+                    if market_id in seen_ids:
+                        continue
+                    seen_ids.add(market_id)
+                    m["_slug"] = slug
+                    found.append(m)
+
+    logger.info("fetch_btc_updown_markets → %d active markets", len(found))
+    return found
 
 
 def get_signal_markets(markets: list[dict]) -> list[dict]:
-    """
-    Convert raw markets into signal dicts.
-    Keeps all with sufficient liquidity; highlights the cheapest outcome.
-    """
+    """Convert raw markets into signal dicts, sorted soonest-expiring first."""
     now = datetime.now(timezone.utc)
     result = []
 
@@ -167,22 +187,19 @@ def get_signal_markets(markets: list[dict]) -> list[dict]:
         if _extract_liquidity(m) < MIN_LIQUIDITY:
             continue
 
-        url = m.get("_event_url") or _build_url(m)
-        if not url:
-            continue
+        slug = m.get("_slug") or m.get("slug") or m.get("eventSlug") or ""
+        url = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
 
         outcomes = _parse_outcomes(m)
         if not outcomes:
             continue
 
         seconds_left = (end_dt - now).total_seconds()
-
-        # Cheapest outcome = highest payout = the signal
         cheapest = min(outcomes, key=lambda x: x[1])
         most_likely = max(outcomes, key=lambda x: x[1])
 
         result.append({
-            "question": m.get("question", "Unknown"),
+            "question": m.get("question", "BTC Up or Down"),
             "outcomes": outcomes,
             "cheapest_name": cheapest[0],
             "cheapest_price": cheapest[1],

@@ -16,10 +16,9 @@ from config import (
     TELEGRAM_CHAT_ID,
     SCAN_INTERVAL_MINUTES,
     TRACKER_POLL_MINUTES,
-    MAX_DAYS_TO_EXPIRY,
     TOP_TRADERS_COUNT,
 )
-from polymarket import fetch_short_term_markets, get_signal_markets
+from polymarket import fetch_btc_updown_markets, get_signal_markets
 from tracker import TraderTracker
 from btc_watcher import BTCWatcher
 from telegram_bot import (
@@ -60,11 +59,11 @@ def validate_config() -> bool:
 # ── Market scanner ────────────────────────────────────────────────────────────
 
 def run_market_scan() -> None:
-    logger.info("Running market scan (≤%s day markets)...", MAX_DAYS_TO_EXPIRY)
+    logger.info("Running BTC up/down market scan...")
     try:
-        markets = fetch_short_term_markets()
+        markets = fetch_btc_updown_markets()
         if not markets:
-            logger.info("No short-term markets found.")
+            logger.info("No BTC up/down markets found.")
             return
 
         signals = get_signal_markets(markets)
@@ -117,13 +116,8 @@ def _watcher_loop() -> None:
 def _send_btc_onchain_signal(signal: dict) -> None:
     """Fetch the live BTC 15m market URL then send the on-chain signal."""
     try:
-        markets = fetch_short_term_markets()
-        btc_market = next(
-            (m for m in get_signal_markets(markets)
-             if "btc" in m["question"].lower() and
-             any(kw in m["question"].lower() for kw in ("up or down", "up/down", "15m", "15 min"))),
-            None,
-        )
+        markets = fetch_btc_updown_markets()
+        btc_market = next(iter(get_signal_markets(markets)), None)
         url = btc_market["url"] if btc_market else "https://polymarket.com"
         expires = btc_market["expires_str"] if btc_market else "~15m"
     except Exception:
