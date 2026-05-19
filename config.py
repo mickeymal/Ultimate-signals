@@ -6,31 +6,22 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# Market scanning — every 5 min to catch fresh short-term markets fast
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "5"))
 
-# Only signal when AI confidence is at or above this percentage
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "35"))
+# Only show markets expiring within this many days (1 = today only)
+MAX_DAYS_TO_EXPIRY = int(os.getenv("MAX_DAYS_TO_EXPIRY", "1"))
 
-# Minutes to wait before rescanning when a scan finds zero signals
-RESCAN_DELAY_MINUTES = int(os.getenv("RESCAN_DELAY_MINUTES", "10"))
+# Minimum liquidity in USD
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "100"))
 
-# Max markets to run AI analysis on per scan (controls API cost)
-MAX_ANALYSIS_PER_SCAN = int(os.getenv("MAX_ANALYSIS_PER_SCAN", "100"))
+# Top trader tracking
+TOP_TRADERS_COUNT = int(os.getenv("TOP_TRADERS_COUNT", "25"))
+TRACKER_POLL_MINUTES = int(os.getenv("TRACKER_POLL_MINUTES", "3"))
 
-# Comma-separated Polymarket categories to skip (sports have no AI edge)
-EXCLUDED_CATEGORIES = [
-    c.strip().lower()
-    for c in os.getenv("EXCLUDED_CATEGORIES", "sports").split(",")
-    if c.strip()
-]
-
-SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
-
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "500"))
-
-# Only analyse markets resolving within this many days
-MAX_DAYS_TO_EXPIRY = int(os.getenv("MAX_DAYS_TO_EXPIRY", "7"))
-
+# Polymarket API bases
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+DATA_API_BASE = "https://data-api.polymarket.com"
+CLOB_API_BASE = "https://clob.polymarket.com"
 
 PAGE_SIZE = 100

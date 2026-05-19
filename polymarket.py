@@ -7,14 +7,15 @@ from config import GAMMA_API_BASE, PAGE_SIZE, MIN_LIQUIDITY, MAX_DAYS_TO_EXPIRY
 
 logger = logging.getLogger(__name__)
 
-SESSION = requests.Session()
-SESSION.headers.update({
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://polymarket.com",
     "Referer": "https://polymarket.com/",
-})
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 
 def _get(url: str, params: dict) -> list | dict | None:
@@ -22,7 +23,6 @@ def _get(url: str, params: dict) -> list | dict | None:
         try:
             resp = SESSION.get(url, params=params, timeout=30)
             if resp.status_code == 422:
-                logger.info("Pagination limit reached at offset=%s", params.get("offset"))
                 return None
             resp.raise_for_status()
             return resp.json()
@@ -30,19 +30,13 @@ def _get(url: str, params: dict) -> list | dict | None:
             wait = 2 ** attempt
             logger.warning("Request failed (attempt %d): %s — retrying in %ds", attempt + 1, e, wait)
             time.sleep(wait)
-    logger.error("All retries exhausted for %s", url)
     return None
 
 
 def fetch_all_markets() -> list[dict]:
-    """
-    Fetch all active markets from the /events endpoint.
-    Events carry a reliable URL slug; each event exposes its child markets inline.
-    Falls back to /markets if /events returns nothing.
-    """
     markets = []
     offset = 0
-    logger.info("Starting full Polymarket scan via /events...")
+    logger.info("Scanning Polymarket for fresh short-term markets...")
 
     while True:
         params = {
@@ -62,80 +56,46 @@ def fetch_all_markets() -> list[dict]:
             break
 
         for event in batch:
-            event_slug = event.get("slug", "")
-            event_url = f"https://polymarket.com/event/{event_slug}" if event_slug else ""
-
-            # Each event can have multiple child markets (outcomes)
-            child_markets = event.get("markets", [])
-            if not child_markets:
-                # Treat the event itself as a single market
-                child_markets = [event]
-
-            for m in child_markets:
-                # Attach the verified event URL so child markets all share it
-                m["_event_url"] = event_url
-                m["_event_slug"] = event_slug
+            slug = event.get("slug", "")
+            url = f"https://polymarket.com/event/{slug}" if slug else ""
+            for m in event.get("markets", [event]):
+                m["_event_url"] = url
+                m["_event_slug"] = slug
                 markets.append(m)
 
-        logger.info("Fetched %d markets (offset=%d)", len(markets), offset)
-
-        if len(batch) < PAGE_SIZE:
-            break
-
-        offset += PAGE_SIZE
-        time.sleep(0.3)
-
-    if not markets:
-        logger.warning("/events returned nothing, falling back to /markets")
-        markets = _fetch_markets_fallback()
-
-    logger.info("Total markets: %d", len(markets))
-    return markets
-
-
-def _fetch_markets_fallback() -> list[dict]:
-    markets = []
-    offset = 0
-    while True:
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": PAGE_SIZE,
-            "offset": offset,
-            "order": "createdAt",
-            "ascending": "false",
-        }
-        data = _get(f"{GAMMA_API_BASE}/markets", params)
-        if not data:
-            break
-        batch = data if isinstance(data, list) else data.get("data", [])
-        if not batch:
-            break
-        markets.extend(batch)
         if len(batch) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
         time.sleep(0.3)
+
+    logger.info("Fetched %d total markets", len(markets))
     return markets
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+def _parse_outcomes(market: dict) -> list[tuple[str, float]]:
+    """Return [(outcome_name, price_cents), ...] for all outcomes."""
+    names_raw = market.get("outcomes", '["Yes","No"]')
+    prices_raw = market.get("outcomePrices", '["0.5","0.5"]')
 
-def _extract_probability(market: dict) -> float | None:
-    outcome_prices = market.get("outcomePrices")
-    if not outcome_prices:
-        return None
-    if isinstance(outcome_prices, str):
+    if isinstance(names_raw, str):
         try:
-            outcome_prices = json.loads(outcome_prices)
+            names_raw = json.loads(names_raw)
+        except Exception:
+            names_raw = ["Yes", "No"]
+
+    if isinstance(prices_raw, str):
+        try:
+            prices_raw = json.loads(prices_raw)
+        except Exception:
+            prices_raw = ["0.5", "0.5"]
+
+    result = []
+    for name, price in zip(names_raw, prices_raw):
+        try:
+            result.append((str(name), round(float(price) * 100, 1)))
         except (ValueError, TypeError):
-            return None
-    if not isinstance(outcome_prices, list) or len(outcome_prices) < 1:
-        return None
-    try:
-        return round(float(outcome_prices[0]) * 100, 2)
-    except (ValueError, TypeError):
-        return None
+            pass
+    return result
 
 
 def _extract_liquidity(market: dict) -> float:
@@ -150,7 +110,7 @@ def _extract_liquidity(market: dict) -> float:
 
 
 def _parse_end_date(market: dict) -> datetime | None:
-    raw = market.get("endDate") or market.get("endDateIso") or market.get("end_date_iso")
+    raw = market.get("endDate") or market.get("endDateIso")
     if not raw:
         return None
     try:
@@ -159,54 +119,63 @@ def _parse_end_date(market: dict) -> datetime | None:
         return None
 
 
-def _build_url(market: dict) -> str:
-    # Prefer the event URL we attached during fetch (most reliable)
-    url = market.get("_event_url", "")
-    if url:
-        return url
-
-    # Fall back to slug-only (never use conditionId — it's a hex hash, not a URL path)
-    slug = market.get("slug", "").strip()
-    if slug:
-        return f"https://polymarket.com/event/{slug}"
-
-    return ""
-
-
-# ── public API ────────────────────────────────────────────────────────────────
-
-def get_short_term_markets(markets: list[dict]) -> list[dict]:
+def get_signal_markets(markets: list[dict]) -> list[dict]:
     """
-    Filter to markets expiring within MAX_DAYS_TO_EXPIRY that have
-    sufficient liquidity and a valid URL. Sorted by liquidity desc.
+    Return all active markets expiring within MAX_DAYS_TO_EXPIRY with
+    sufficient liquidity, parsed for immediate signalling.
+    Sorted soonest-expiring first.
     """
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(days=MAX_DAYS_TO_EXPIRY)
     result = []
 
     for m in markets:
-        liquidity = _extract_liquidity(m)
-        if liquidity < MIN_LIQUIDITY:
-            continue
-
         end_dt = _parse_end_date(m)
         if end_dt is None or end_dt > cutoff or end_dt <= now:
             continue
 
-        url = _build_url(m)
-        if not url:
-            continue  # skip markets with no valid link
+        liquidity = _extract_liquidity(m)
+        if liquidity < MIN_LIQUIDITY:
+            continue
 
-        days_left = (end_dt - now).total_seconds() / 86400
+        url = m.get("_event_url", "")
+        if not url:
+            slug = m.get("slug", "").strip()
+            url = f"https://polymarket.com/event/{slug}" if slug else ""
+        if not url:
+            continue
+
+        outcomes = _parse_outcomes(m)
+        if not outcomes:
+            continue
+
+        seconds_left = (end_dt - now).total_seconds()
+        if seconds_left < 60:
+            expires_str = f"{int(seconds_left)}s"
+        elif seconds_left < 3600:
+            expires_str = f"{int(seconds_left // 60)}m"
+        elif seconds_left < 86400:
+            h = int(seconds_left // 3600)
+            mn = int((seconds_left % 3600) // 60)
+            expires_str = f"{h}h {mn}m"
+        else:
+            expires_str = f"{round(seconds_left / 86400, 1)}d"
+
+        # Signal direction: cheapest outcome = highest return potential
+        cheapest = min(outcomes, key=lambda x: x[1])
+        signal_direction = cheapest[0].upper()
+
         result.append({
             "question": m.get("question", "Unknown"),
-            "polymarket_prob": _extract_probability(m),
+            "outcomes": outcomes,
+            "signal_direction": signal_direction,
+            "signal_price": cheapest[1],
             "liquidity": liquidity,
             "url": url,
-            "category": m.get("category", (m.get("tags") or [""])[0]),
-            "end_date": end_dt.strftime("%Y-%m-%d"),
-            "days_left": round(days_left, 1),
+            "expires_str": expires_str,
+            "seconds_left": seconds_left,
+            "end_date": end_dt.strftime("%Y-%m-%d %H:%M UTC"),
         })
 
-    result.sort(key=lambda x: x["liquidity"], reverse=True)
+    result.sort(key=lambda x: x["seconds_left"])
     return result

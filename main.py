@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
 Polymarket Signal Bot
-Scans all short-term Polymarket markets, analyses each with Groq/Llama,
-and sends Telegram alerts when AI confidence >= CONFIDENCE_THRESHOLD.
-If a scan finds no signals, it rescans after RESCAN_DELAY_MINUTES.
+- Scans all short-term markets every SCAN_INTERVAL_MINUTES and sends signals immediately.
+- Tracks the top 25 most profitable traders every TRACKER_POLL_MINUTES and alerts on every trade.
 """
 
 import logging
 import sys
 import time
+import threading
 import schedule
 
 from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
-    GROQ_API_KEY,
-    CONFIDENCE_THRESHOLD,
     SCAN_INTERVAL_MINUTES,
-    RESCAN_DELAY_MINUTES,
+    TRACKER_POLL_MINUTES,
     MAX_DAYS_TO_EXPIRY,
+    TOP_TRADERS_COUNT,
 )
-from polymarket import fetch_all_markets, get_short_term_markets
-from analyzer import analyse_markets
-from telegram_bot import send_message, send_signals
+from polymarket import fetch_all_markets, get_signal_markets
+from tracker import TraderTracker
+from telegram_bot import (
+    send_message,
+    send_market_signal,
+    send_batch_header,
+    send_no_signals,
+    send_trader_signal,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +39,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_trader_tracker = TraderTracker()
+
 
 def validate_config() -> bool:
     ok = True
@@ -43,85 +50,107 @@ def validate_config() -> bool:
     if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "your_chat_id_here":
         logger.error("TELEGRAM_CHAT_ID is not set.")
         ok = False
-    if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_key_here":
-        logger.error("GROQ_API_KEY is not set. Get a free key at console.groq.com")
-        ok = False
     return ok
 
 
-def _do_scan() -> int:
-    """
-    Run one full scan cycle. Returns the number of signals found.
-    Returns -1 on a hard error (API down etc).
-    """
+# ── Market scanner ────────────────────────────────────────────────────────────
+
+def run_market_scan() -> None:
+    logger.info("Running market scan (≤%d day markets)...", MAX_DAYS_TO_EXPIRY)
     try:
         all_markets = fetch_all_markets()
         if not all_markets:
-            send_message("⚠️ Polymarket returned 0 markets — API may be down.")
-            return -1
+            logger.warning("No markets returned from Polymarket API.")
+            return
 
-        short_term = get_short_term_markets(all_markets)
-        logger.info(
-            "%d total markets → %d short-term candidates (≤%dd)",
-            len(all_markets), len(short_term), MAX_DAYS_TO_EXPIRY,
-        )
+        signals = get_signal_markets(all_markets)
+        logger.info("%d signal markets found from %d total", len(signals), len(all_markets))
 
-        if not short_term:
-            logger.info("No short-term markets found this scan.")
-            return 0
+        if not signals:
+            send_no_signals(len(all_markets))
+            return
 
-        signals = analyse_markets(short_term)
-        send_signals(signals, len(all_markets), len(short_term))
-        return len(signals)
+        send_batch_header(len(signals), len(all_markets))
+        time.sleep(0.5)
+
+        for s in signals:
+            send_market_signal(s)
+            time.sleep(0.4)
 
     except Exception:
-        logger.exception("Unexpected error during scan")
-        send_message("❌ Bot encountered an error during scan. Check logs.")
-        return -1
+        logger.exception("Error during market scan")
 
 
-def run_scan() -> None:
-    """Scheduled entry point. Rescans after a short delay if nothing was found."""
-    logger.info("Starting scan cycle")
-    found = _do_scan()
+# ── Trader tracker ────────────────────────────────────────────────────────────
 
-    if found == 0:
-        logger.info(
-            "No signals found — rescanning in %d minutes", RESCAN_DELAY_MINUTES
-        )
-        time.sleep(RESCAN_DELAY_MINUTES * 60)
-        logger.info("Rescanning now...")
-        _do_scan()
+def run_trader_check() -> None:
+    logger.info("Checking top trader activity...")
+    try:
+        new_trades = _trader_tracker.check_new_trades()
+        if not new_trades:
+            logger.info("No new trader activity")
+            return
 
+        logger.info("%d new trader trades found — alerting now", len(new_trades))
+        for trade in new_trades:
+            send_trader_signal(trade)
+            time.sleep(0.3)
+
+    except Exception:
+        logger.exception("Error during trader check")
+
+
+def _trader_loop() -> None:
+    """Run the trader tracker on its own tight loop in a background thread."""
+    while True:
+        run_trader_check()
+        time.sleep(TRACKER_POLL_MINUTES * 60)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     if not validate_config():
         sys.exit(1)
 
-    logger.info("Polymarket Signal Bot starting")
-    logger.info("Confidence threshold: %.0f%%", CONFIDENCE_THRESHOLD)
+    logger.info("Polymarket Signal Bot starting up")
     logger.info(
-        "Max expiry: %d days | Scan every %d min | Rescan delay: %d min",
-        MAX_DAYS_TO_EXPIRY, SCAN_INTERVAL_MINUTES, RESCAN_DELAY_MINUTES,
+        "Market scan: every %d min | Trader poll: every %d min | Top traders: %d",
+        SCAN_INTERVAL_MINUTES, TRACKER_POLL_MINUTES, TOP_TRADERS_COUNT,
     )
 
     send_message(
         f"🤖 <b>Polymarket Signal Bot Online</b>\n\n"
-        f"Confidence threshold: <b>{CONFIDENCE_THRESHOLD:.0f}%</b>\n"
-        f"Short-term trades ≤ <b>{MAX_DAYS_TO_EXPIRY} days</b>\n"
-        f"Scans every <b>{SCAN_INTERVAL_MINUTES} min</b> · "
-        f"Rescans in <b>{RESCAN_DELAY_MINUTES} min</b> if nothing found\n\n"
-        f"Running first scan now..."
+        f"📊 Market signals: every <b>{SCAN_INTERVAL_MINUTES} min</b> "
+        f"(≤{MAX_DAYS_TO_EXPIRY}d markets)\n"
+        f"👤 Top <b>{TOP_TRADERS_COUNT}</b> traders monitored every <b>{TRACKER_POLL_MINUTES} min</b>\n\n"
+        f"Starting now..."
     )
 
-    run_scan()
+    # Load leaderboard at startup
+    logger.info("Loading top %d traders...", TOP_TRADERS_COUNT)
+    _trader_tracker.refresh_traders()
 
-    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_scan)
-    logger.info("Scheduler started. Next scan in %d minutes.", SCAN_INTERVAL_MINUTES)
+    # First market scan immediately
+    run_market_scan()
+
+    # First trader check immediately
+    run_trader_check()
+
+    # Schedule regular market scans on the main thread
+    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(run_market_scan)
+
+    # Refresh leaderboard once an hour
+    schedule.every(60).minutes.do(_trader_tracker.refresh_traders)
+
+    # Trader checks run on a background thread so they never block market scans
+    t = threading.Thread(target=_trader_loop, daemon=True)
+    t.start()
+    logger.info("Trader tracker running in background thread")
 
     while True:
         schedule.run_pending()
-        time.sleep(30)
+        time.sleep(15)
 
 
 if __name__ == "__main__":

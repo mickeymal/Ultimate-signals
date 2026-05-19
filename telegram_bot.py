@@ -5,9 +5,8 @@ import requests
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 logger = logging.getLogger(__name__)
-
 API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-MAX_MESSAGE_LENGTH = 4096
+MAX_LEN = 4096
 
 
 def _send_raw(text: str) -> bool:
@@ -21,9 +20,8 @@ def _send_raw(text: str) -> bool:
         try:
             resp = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
             if resp.status_code == 429:
-                retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
-                logger.warning("Telegram rate limited — waiting %ds", retry_after)
-                time.sleep(retry_after)
+                wait = resp.json().get("parameters", {}).get("retry_after", 5)
+                time.sleep(wait)
                 continue
             resp.raise_for_status()
             return True
@@ -34,53 +32,101 @@ def _send_raw(text: str) -> bool:
 
 
 def send_message(text: str) -> bool:
-    if len(text) <= MAX_MESSAGE_LENGTH:
+    if len(text) <= MAX_LEN:
         return _send_raw(text)
-    chunks = []
-    while text:
-        chunk = text[:MAX_MESSAGE_LENGTH]
-        split_at = chunk.rfind("\n")
-        if split_at > MAX_MESSAGE_LENGTH // 2:
-            chunk = chunk[:split_at]
+    chunks, remaining = [], text
+    while remaining:
+        chunk = remaining[:MAX_LEN]
+        split = chunk.rfind("\n")
+        if split > MAX_LEN // 2:
+            chunk = chunk[:split]
         chunks.append(chunk)
-        text = text[len(chunk):]
-    success = True
+        remaining = remaining[len(chunk):]
+    ok = True
     for chunk in chunks:
         if not _send_raw(chunk):
-            success = False
-        time.sleep(0.5)
-    return success
-
-
-def send_signals(signals: list[dict], total_scanned: int, total_analysed: int) -> None:
-    if not signals:
-        send_message(
-            f"🔍 <b>Scan complete</b>\n"
-            f"Scanned {total_scanned} markets · Analysed {total_analysed} short-term\n"
-            f"No high-confidence signals this round."
-        )
-        return
-
-    send_message(
-        f"📊 <b>{len(signals)} SIGNAL{'S' if len(signals) > 1 else ''} FOUND</b>\n"
-        f"Scanned {total_scanned} markets · Analysed {total_analysed} · "
-        f"Signalled {len(signals)}"
-    )
-    time.sleep(0.5)
-
-    for s in signals:
-        direction = s["direction"]
-        emoji = "🟢" if direction == "YES" else "🔴"
-        days = s["days_left"]
-        expires = f"{days}d" if days >= 1 else f"{round(days * 24)}h"
-        poly_prob = s.get("polymarket_prob")
-        poly_str = f"Polymarket: {poly_prob}%  |  " if poly_prob is not None else ""
-
-        send_message(
-            f"{emoji} <b>{html.escape(s['trade'])}</b>  —  <b>{s['confidence']:.0f}% confident</b>\n"
-            f"<b>{html.escape(s['question'])}</b>\n"
-            f"📝 {html.escape(s['reason'])}\n"
-            f"{poly_str}Liquidity: ${s['liquidity']:,.0f}  |  Expires: {expires}\n"
-            f"🔗 <a href=\"{s['url']}\">{s['url']}</a>"
-        )
+            ok = False
         time.sleep(0.4)
+    return ok
+
+
+def _outcome_line(outcomes: list[tuple[str, float]]) -> str:
+    parts = []
+    for name, cents in outcomes:
+        name_up = name.upper()
+        if name_up in ("UP", "YES"):
+            emoji = "⬆️"
+        elif name_up in ("DOWN", "NO"):
+            emoji = "⬇️"
+        else:
+            emoji = "🔘"
+        parts.append(f"{emoji} <b>{html.escape(name)}</b> {cents:.0f}¢")
+    return "  |  ".join(parts)
+
+
+def send_market_signal(market: dict) -> bool:
+    """Send one market signal message formatted like the Polymarket app."""
+    outcomes = market["outcomes"]
+    direction = html.escape(market["signal_direction"])
+    price = market["signal_price"]
+    question = html.escape(market["question"])
+    expires = market["expires_str"]
+    liquidity = market["liquidity"]
+    url = market["url"]
+
+    arrow = "⬆️" if direction in ("YES", "UP") else "⬇️"
+
+    text = (
+        f"⚡ <b>MARKET SIGNAL</b>\n"
+        f"<b>{question}</b>\n\n"
+        f"{_outcome_line(outcomes)}\n\n"
+        f"Signal: {arrow} <b>BUY {direction}</b> @ <b>{price:.0f}¢</b>\n"
+        f"💧 Liquidity: <b>${liquidity:,.0f}</b>  |  ⏱ Expires: <b>{expires}</b>\n"
+        f"🔗 <a href=\"{url}\">{url}</a>"
+    )
+    return send_message(text)
+
+
+def send_batch_header(count: int, total_scanned: int) -> bool:
+    return send_message(
+        f"📊 <b>{count} MARKET SIGNAL{'S' if count != 1 else ''}</b>  "
+        f"<i>({total_scanned} markets scanned)</i>"
+    )
+
+
+def send_trader_signal(trade: dict) -> bool:
+    """Send an immediate alert when a top trader makes a move."""
+    pnl = trade["trader_pnl"]
+    pnl_str = f"${pnl:,.0f}" if pnl >= 0 else f"-${abs(pnl):,.0f}"
+
+    side = trade["side"]
+    outcome = trade["outcome"]
+    price = trade["price_cents"]
+    size = trade["size_usd"]
+    question = html.escape(trade["question"])
+    name = html.escape(trade["trader_name"])
+    url = trade["market_url"]
+
+    if side == "BUY":
+        action_emoji = "🟢"
+        action = f"BUY {outcome}"
+    else:
+        action_emoji = "🔴"
+        action = f"SELL {outcome}"
+
+    size_str = f"${size:,.0f}" if size >= 1 else f"{size:.2f}"
+
+    text = (
+        f"👤 <b>TOP TRADER ALERT</b>\n"
+        f"{action_emoji} <b>{name}</b>  <i>(All-time P&L: {pnl_str})</i>\n\n"
+        f"<b>{action}</b> @ <b>{price:.0f}¢</b>  |  Size: <b>{size_str}</b>\n"
+        f"📋 {question}\n"
+        f"🔗 <a href=\"{url}\">{url}</a>"
+    )
+    return send_message(text)
+
+
+def send_no_signals(total_scanned: int) -> bool:
+    return send_message(
+        f"🔍 Scan complete — {total_scanned} markets checked, no short-term signals right now."
+    )
