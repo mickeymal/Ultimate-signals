@@ -13,7 +13,7 @@ import schedule
 from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
-    ANTHROPIC_API_KEY,
+    GROQ_API_KEY,
     CONFIDENCE_THRESHOLD,
     SCAN_INTERVAL_MINUTES,
     MAX_DAYS_TO_EXPIRY,
@@ -41,8 +41,8 @@ def validate_config() -> bool:
     if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "your_chat_id_here":
         logger.error("TELEGRAM_CHAT_ID is not set.")
         ok = False
-    if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "your_anthropic_key_here":
-        logger.error("ANTHROPIC_API_KEY is not set.")
+    if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_key_here":
+        logger.error("GROQ_API_KEY is not set. Get a free key at console.groq.com")
         ok = False
     return ok
 
