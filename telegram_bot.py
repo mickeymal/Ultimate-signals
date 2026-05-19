@@ -135,21 +135,29 @@ def send_trader_signal(trade: dict) -> bool:
 
 
 def send_btc_signal(signal: dict, market_url: str, expires: str) -> bool:
-    """On-chain mempool signal for the BTC Up/Down 15m market."""
+    """On-chain / exchange signal for the BTC Up/Down 15m market."""
     direction = signal["direction"]
-    arrow = "⬆️" if direction == "UP" else "⬇️"
-    indicator = signal.get("indicator", "ON-CHAIN")
-    reason = html.escape(signal.get("reason", ""))
-    fee = signal.get("fast_fee", 0)
-    mempool = signal.get("mempool_count", 0)
+    arrow     = "⬆️" if direction == "UP" else "⬇️"
+    indicator = html.escape(signal.get("indicator", "SIGNAL"))
+    reason    = html.escape(signal.get("reason", ""))
+
+    obi      = signal.get("obi")
+    funding  = signal.get("funding")
+    l_buys   = signal.get("large_buys", 0)
+    l_sells  = signal.get("large_sells", 0)
+
+    obi_str     = f"{obi:+.2f}" if obi is not None else "—"
+    funding_str = f"{funding*100:.4f}%" if funding is not None else "—"
+    trades_str  = f"{l_buys}B / {l_sells}S"
+
+    evidence_lines = "\n".join(f"  • {html.escape(e)}" for e in reason.split(" · ") if e)
 
     text = (
-        f"⛓ <b>ON-CHAIN SIGNAL  →  BTC Up or Down 15m</b>\n\n"
-        f"🔍 <b>{indicator}</b>\n"
-        f"{reason}\n\n"
-        f"🎯 Signal: {arrow} <b>BUY {direction}</b>\n"
-        f"⏱ Act within next <b>2-3 minutes</b>  |  Market expires: <b>{expires}</b>\n\n"
-        f"📡 Fee: <b>{fee:.0f} sat/vB</b>  |  Mempool: <b>{mempool:,} txns</b>\n"
+        f"⚡ <b>BTC SIGNAL  →  Up or Down 15m</b>\n\n"
+        f"🎯 <b>{arrow} BUY {direction}</b>  —  <b>{indicator}</b>\n\n"
+        f"<b>Evidence:</b>\n{evidence_lines}\n\n"
+        f"📊 OBI: <b>{obi_str}</b>  |  Funding: <b>{funding_str}</b>  |  Large trades: <b>{trades_str}</b>\n"
+        f"⏱ Act within <b>2 min</b>  |  Market expires: <b>{expires}</b>\n"
         f"🔗 <a href=\"{market_url}\">{market_url}</a>"
     )
     return send_message(text)

@@ -1,162 +1,240 @@
 """
-Bitcoin on-chain watcher.
-When the Polymarket leaderboard is unavailable, this module monitors the
-Bitcoin mempool for patterns that tend to precede short-term price moves.
-Only used to generate signals for the BTC Up/Down 15m market.
+Bitcoin price signal watcher for the Polymarket BTC Up/Down 15m market.
 
-Free data source: mempool.space public API (no key needed).
+Uses Binance public API (no key needed) — the same data professional traders use.
+Signals only fire when MULTIPLE indicators agree, preventing false positives.
 
-Signals watched:
-  - Fee spike  : sudden rise in sat/vB → network stress → likely DOWN
-  - Whale flood: multiple large unconfirmed txns (>50 BTC each) → volatility
-  - Mempool clearing: congestion drains rapidly after being heavy → UP
-  - Low-fee quiet: sub-5 sat/vB after a high period → market calming → UP
+Indicators:
+  1. Order Book Imbalance (OBI) — bid vs ask pressure within 1% of price
+  2. Funding Rate — perpetual futures longs/shorts imbalance (reversal signal)
+  3. Large Trade Detection — block trades >5 BTC in same direction
+  4. Price Momentum — consecutive 1m candles + volume surge
 """
 
 import logging
 import time
 import requests
+from statistics import mean, stdev
 
 logger = logging.getLogger(__name__)
 
-MEMPOOL_API = "https://mempool.space/api"
+BINANCE_SPOT   = "https://api.binance.com/api/v3"
+BINANCE_FUTURE = "https://fapi.binance.com/fapi/v1"
+SYMBOL = "BTCUSDT"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# Tunable thresholds
-FEE_SPIKE_MULTIPLIER = 2.5   # fast fee doubles = spike
-FEE_HIGH_SAT = 40            # sat/vB above this = network stress
-FEE_CALM_SAT = 5             # sat/vB below this = quiet network
-WHALE_BTC = 30               # single unconfirmed tx above this = whale
-WHALE_TOTAL_BTC = 200        # aggregate whale BTC in mempool = big signal
-MEMPOOL_LARGE = 80_000       # txn count above this = congested
-MEMPOOL_DRAIN_RATIO = 0.4    # drops to 40% of previous = rapid clear
-SIGNAL_COOLDOWN = 240        # seconds between signals (avoid spam)
+# ── Thresholds (empirically reasonable for 15m BTC) ─────────────────────────
+OBI_STRONG      = 0.30    # |OBI| above this = clear directional pressure
+OBI_MODERATE    = 0.20    # |OBI| above this = mild pressure (needs another signal)
+FUNDING_HIGH    = 0.0008  # > 0.08% per 8h → longs overbought → DOWN
+FUNDING_LOW     = -0.0004 # < -0.04% per 8h → shorts overbought → UP
+LARGE_TRADE_BTC = 5.0     # single trade ≥ 5 BTC is "large"
+LARGE_TRADE_MIN = 3       # need ≥ 3 large trades in one direction
+MOMENTUM_BARS   = 3       # consecutive 1m candles same direction
+VOL_SURGE_X     = 2.0     # latest candle volume ≥ 2× recent average
+SIGNAL_COOLDOWN = 240     # seconds between signals
 
 
-def _get(path: str):
+def _get(base: str, path: str, params: dict | None = None):
     try:
-        resp = requests.get(f"{MEMPOOL_API}/{path}", headers=HEADERS, timeout=10)
+        resp = requests.get(f"{base}/{path}", params=params, headers=HEADERS, timeout=8)
         if resp.ok:
             return resp.json()
+        logger.debug("Binance %s %s → %d", base, path, resp.status_code)
     except Exception as e:
-        logger.debug("mempool.space %s failed: %s", path, e)
+        logger.debug("Binance request failed: %s", e)
     return None
 
 
+# ── Individual indicator functions ───────────────────────────────────────────
+
+def _order_book_imbalance() -> float | None:
+    """
+    OBI = (total bid qty − total ask qty) / (total bid qty + total ask qty)
+    Range −1 to +1.  > 0 = buy pressure,  < 0 = sell pressure.
+    Only counts levels within 1% of mid price.
+    """
+    data = _get(BINANCE_SPOT, "depth", {"symbol": SYMBOL, "limit": 50})
+    if not data:
+        return None
+    try:
+        bids = [(float(p), float(q)) for p, q in data["bids"]]
+        asks = [(float(p), float(q)) for p, q in data["asks"]]
+        if not bids or not asks:
+            return None
+        mid = (bids[0][0] + asks[0][0]) / 2
+        band = mid * 0.01
+        bid_vol = sum(q for p, q in bids if p >= mid - band)
+        ask_vol = sum(q for p, q in asks if p <= mid + band)
+        total = bid_vol + ask_vol
+        return (bid_vol - ask_vol) / total if total > 0 else None
+    except Exception as e:
+        logger.debug("OBI calc error: %s", e)
+        return None
+
+
+def _funding_rate() -> float | None:
+    """Current perpetual funding rate. Positive = longs pay shorts."""
+    data = _get(BINANCE_FUTURE, "premiumIndex", {"symbol": SYMBOL})
+    if not data:
+        return None
+    try:
+        return float(data.get("lastFundingRate", 0))
+    except (ValueError, TypeError):
+        return None
+
+
+def _large_trade_direction() -> tuple[int, int] | None:
+    """
+    Returns (large_buys, large_sells) — count of trades ≥ LARGE_TRADE_BTC
+    from the last 500 trades.
+    """
+    data = _get(BINANCE_SPOT, "trades", {"symbol": SYMBOL, "limit": 500})
+    if not data:
+        return None
+    try:
+        buys = sells = 0
+        for t in data:
+            qty = float(t["qty"])
+            if qty < LARGE_TRADE_BTC:
+                continue
+            if t["isBuyerMaker"] is False:   # taker is buyer = aggressive buy
+                buys += 1
+            else:
+                sells += 1
+        return buys, sells
+    except Exception as e:
+        logger.debug("Large trade error: %s", e)
+        return None
+
+
+def _price_momentum() -> dict | None:
+    """
+    Returns {direction: 'UP'|'DOWN'|None, volume_surge: bool}
+    based on last MOMENTUM_BARS 1-minute candles.
+    """
+    data = _get(BINANCE_SPOT, "klines", {
+        "symbol": SYMBOL, "interval": "1m", "limit": MOMENTUM_BARS + 3,
+    })
+    if not data or len(data) < MOMENTUM_BARS + 1:
+        return None
+    try:
+        # Each kline: [open_time, open, high, low, close, volume, ...]
+        candles = [(float(k[1]), float(k[4]), float(k[5])) for k in data]
+        # Use the MOMENTUM_BARS most recent CLOSED candles (exclude last which is open)
+        recent = candles[-(MOMENTUM_BARS + 1):-1]
+        directions = ["UP" if c > o else "DOWN" for o, c, v in recent]
+        volumes = [v for o, c, v in recent]
+
+        if len(set(directions)) == 1:
+            direction = directions[0]
+        else:
+            direction = None
+
+        avg_vol = mean(volumes[:-1]) if len(volumes) > 1 else volumes[0]
+        surge = volumes[-1] >= avg_vol * VOL_SURGE_X if avg_vol > 0 else False
+        return {"direction": direction, "volume_surge": surge, "volumes": volumes}
+    except Exception as e:
+        logger.debug("Momentum error: %s", e)
+        return None
+
+
+# ── Signal aggregator ────────────────────────────────────────────────────────
+
 class BTCWatcher:
     """
-    Call check() every ~30s from a background thread.
-    Returns a signal dict when conditions suggest an imminent BTC price move,
-    None otherwise.
+    Call check() every ~30s.
+    Returns a signal dict only when ≥2 independent indicators agree.
+    Returns None when evidence is mixed or insufficient.
     """
 
     def __init__(self):
-        self._prev_fee: float | None = None
-        self._prev_mempool_count: int | None = None
         self._last_signal_at: float = 0
 
     def _cooldown_ok(self) -> bool:
         return time.time() - self._last_signal_at >= SIGNAL_COOLDOWN
 
     def check(self) -> dict | None:
-        fees = _get("v1/fees/recommended")
-        mempool = _get("mempool")
-        recent_txns = _get("mempool/recent") or []
-
-        if not fees:
+        if not self._cooldown_ok():
             return None
 
-        fast_fee = float(fees.get("fastestFee", 0))
-        current_count = int((mempool or {}).get("count", 0))
+        # Gather all indicators
+        obi       = _order_book_imbalance()
+        funding   = _funding_rate()
+        trades    = _large_trade_direction()
+        momentum  = _price_momentum()
 
-        signal = None
+        votes_up   = []
+        votes_down = []
 
-        # ── 1. Fee spike ─────────────────────────────────────────────────────
-        if (
-            self._prev_fee
-            and fast_fee >= self._prev_fee * FEE_SPIKE_MULTIPLIER
-            and fast_fee >= FEE_HIGH_SAT
-            and self._cooldown_ok()
-        ):
-            signal = {
-                "direction": "DOWN",
-                "reason": (
-                    f"Fee spike: {self._prev_fee:.0f} → {fast_fee:.0f} sat/vB "
-                    f"({fast_fee / max(self._prev_fee, 1):.1f}x). "
-                    "Network stress usually precedes sell pressure."
-                ),
-                "indicator": "FEE SPIKE",
-            }
+        # ── Order book imbalance ─────────────────────────────────────────────
+        if obi is not None:
+            if obi >= OBI_STRONG:
+                votes_up.append(f"Order book: {obi:+.2f} (strong buy pressure)")
+            elif obi <= -OBI_STRONG:
+                votes_down.append(f"Order book: {obi:+.2f} (strong sell pressure)")
+            elif obi >= OBI_MODERATE:
+                votes_up.append(f"Order book: {obi:+.2f} (mild buy pressure)")
+            elif obi <= -OBI_MODERATE:
+                votes_down.append(f"Order book: {obi:+.2f} (mild sell pressure)")
 
-        # ── 2. Whale transactions in mempool ─────────────────────────────────
-        if not signal and self._cooldown_ok():
-            whales = []
-            for tx in recent_txns:
-                sats = tx.get("value", 0)
-                btc = sats / 1e8
-                if btc >= WHALE_BTC:
-                    whales.append(round(btc, 1))
+        # ── Funding rate ─────────────────────────────────────────────────────
+        if funding is not None:
+            if funding >= FUNDING_HIGH:
+                votes_down.append(f"Funding: {funding*100:.3f}% (longs overbought → reversal risk)")
+            elif funding <= FUNDING_LOW:
+                votes_up.append(f"Funding: {funding*100:.3f}% (shorts overbought → squeeze risk)")
 
-            whale_total = sum(whales)
-            if whale_total >= WHALE_TOTAL_BTC:
-                signal = {
-                    "direction": "DOWN",
-                    "reason": (
-                        f"{len(whales)} whale txn(s) totalling {whale_total:.0f} BTC "
-                        "just hit the mempool. Large moves often signal selling."
-                    ),
-                    "indicator": "WHALE MOVEMENT",
-                }
+        # ── Large trades ─────────────────────────────────────────────────────
+        if trades:
+            big_buys, big_sells = trades
+            if big_buys >= LARGE_TRADE_MIN and big_buys > big_sells * 1.5:
+                votes_up.append(f"Large trades: {big_buys} big buys vs {big_sells} sells")
+            elif big_sells >= LARGE_TRADE_MIN and big_sells > big_buys * 1.5:
+                votes_down.append(f"Large trades: {big_sells} big sells vs {big_buys} buys")
 
-        # ── 3. Mempool rapidly clearing ──────────────────────────────────────
-        if (
-            not signal
-            and self._prev_mempool_count
-            and self._prev_mempool_count >= MEMPOOL_LARGE
-            and current_count > 0
-            and current_count <= self._prev_mempool_count * MEMPOOL_DRAIN_RATIO
-            and self._cooldown_ok()
-        ):
-            signal = {
-                "direction": "UP",
-                "reason": (
-                    f"Mempool drained: {self._prev_mempool_count:,} → {current_count:,} txns. "
-                    "Rapid clearing after congestion often signals sell exhaustion."
-                ),
-                "indicator": "MEMPOOL CLEAR",
-            }
+        # ── Price momentum ────────────────────────────────────────────────────
+        if momentum and momentum["direction"]:
+            surge_tag = " + volume surge" if momentum["volume_surge"] else ""
+            if momentum["direction"] == "UP":
+                votes_up.append(f"{MOMENTUM_BARS} consecutive UP candles{surge_tag}")
+            else:
+                votes_down.append(f"{MOMENTUM_BARS} consecutive DOWN candles{surge_tag}")
 
-        # ── 4. Very low fees after a high period ─────────────────────────────
-        if (
-            not signal
-            and self._prev_fee
-            and self._prev_fee >= FEE_HIGH_SAT
-            and fast_fee <= FEE_CALM_SAT
-            and self._cooldown_ok()
-        ):
-            signal = {
-                "direction": "UP",
-                "reason": (
-                    f"Fees dropped to {fast_fee:.0f} sat/vB (was {self._prev_fee:.0f}). "
-                    "Calm network after stress often precedes a bounce."
-                ),
-                "indicator": "FEE CALM",
-            }
+        # ── Decide — require ≥2 votes in same direction ───────────────────────
+        direction = None
+        evidence  = []
 
-        # ── update state ─────────────────────────────────────────────────────
-        self._prev_fee = fast_fee
-        if current_count:
-            self._prev_mempool_count = current_count
+        if len(votes_up) >= 2 and len(votes_up) > len(votes_down):
+            direction = "UP"
+            evidence  = votes_up
+        elif len(votes_down) >= 2 and len(votes_down) > len(votes_up):
+            direction = "DOWN"
+            evidence  = votes_down
 
-        if signal:
-            self._last_signal_at = time.time()
-            signal.update({
-                "fast_fee": fast_fee,
-                "mempool_count": current_count,
-            })
-            logger.info(
-                "BTC signal: %s → %s | fee=%s sat/vB | mempool=%s txns",
-                signal["indicator"], signal["direction"], fast_fee, current_count,
+        if not direction:
+            logger.debug(
+                "No signal — up_votes=%d down_votes=%d obi=%s funding=%s",
+                len(votes_up), len(votes_down),
+                f"{obi:+.2f}" if obi is not None else "N/A",
+                f"{funding*100:.3f}%" if funding is not None else "N/A",
             )
+            return None
 
-        return signal
+        self._last_signal_at = time.time()
+        logger.info(
+            "BTC signal: %s | %d evidence points | obi=%s funding=%s",
+            direction, len(evidence),
+            f"{obi:+.2f}" if obi is not None else "N/A",
+            f"{funding*100:.4f}%" if funding is not None else "N/A",
+        )
+
+        return {
+            "direction": direction,
+            "indicator": f"{len(evidence)} SIGNALS AGREE",
+            "reason": " · ".join(evidence),
+            "obi": obi,
+            "funding": funding,
+            "large_buys": trades[0] if trades else 0,
+            "large_sells": trades[1] if trades else 0,
+        }
